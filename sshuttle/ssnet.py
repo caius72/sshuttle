@@ -26,8 +26,17 @@ MAX_CHANNEL = 65535
 # all queued behind the same close().
 #
 # Closing on helper threads keeps the event loop responsive. The threads only
-# ever sleep in close(), so the pool size just sets how fast a backlog drains.
+# ever sleep in close(), so the pool size just sets how fast a backlog drains:
+# CLOSERS/latency closes per second.
 CLOSERS = 4
+
+# Cap on the number of finished sockets waiting to be closed. Each one holds
+# its fd open until a helper gets to it, so an unbounded queue trades a stalled
+# event loop for fd exhaustion under sustained churn that outruns the closers.
+# Past this many, close_later() closes inline instead: at that point the
+# backlog is pathological and stalling is the lesser failure.
+MAX_CLOSE_BACKLOG = 512
+
 _close_q = None
 
 
@@ -39,17 +48,16 @@ def close_later(sock):
     the fd) is queued, which keeps it referenced until the helper closes it,
     so the interpreter cannot close the same fd twice.
 
-    The queue is unbounded. If closes run slower than connection churn, the
-    finished sockets pile up in it and hold their fds open until a helper
-    gets to them, so a long burst can push the process toward its fd limit.
-    Bounding the queue would just move the stall back onto the event loop,
-    which is the thing this is here to avoid.
+    If closes run slower than connection churn, the finished sockets pile up
+    in the queue and hold their fds open until a helper gets to them. The
+    queue is capped at MAX_CLOSE_BACKLOG for that reason; beyond it we close
+    inline and take the stall, rather than run the process out of fds.
     """
     global _close_q
     if sock is None:
         return
     if _close_q is None:
-        _close_q = queue.SimpleQueue()
+        _close_q = queue.Queue(maxsize=MAX_CLOSE_BACKLOG)
 
         def closer():
             while True:
@@ -62,7 +70,14 @@ def close_later(sock):
         for i in range(CLOSERS):
             threading.Thread(target=closer, name='sshuttle-closer-%d' % i,
                              daemon=True).start()
-    _close_q.put(sock)
+    try:
+        _close_q.put_nowait(sock)
+    except queue.Full:
+        debug1('close backlog full (%d); closing inline' % MAX_CLOSE_BACKLOG)
+        try:
+            sock.close()
+        except Exception as e:
+            debug1('error closing %r: %s' % (sock, e))
 
 
 LATENCY_BUFFER_SIZE = 32768

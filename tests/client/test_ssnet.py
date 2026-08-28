@@ -1,3 +1,4 @@
+import queue
 import socket
 import time
 
@@ -35,6 +36,27 @@ def test_close_later_tolerates_none_and_double_close():
     ssnet.close_later(s)  # already closed; must not raise
     assert _drain()
     other.close()
+
+
+def test_close_later_closes_inline_when_the_backlog_is_full():
+    """A full queue means the closers cannot keep up; holding the fd open
+    would be worse than taking the stall here."""
+    class FullQueue:
+        # raises from put() too, so a regression fails instead of hanging
+        def put_nowait(self, item):
+            raise queue.Full
+
+        put = put_nowait
+
+    a, b = socket.socketpair()
+    saved = ssnet._close_q
+    ssnet._close_q = FullQueue()
+    try:
+        ssnet.close_later(a)
+        assert a.fileno() == -1  # closed inline, not queued
+    finally:
+        ssnet._close_q = saved
+        b.close()
 
 
 def test_handler_dispose_is_a_noop():
